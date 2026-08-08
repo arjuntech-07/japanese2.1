@@ -27,7 +27,7 @@ logging.getLogger("manga_ocr").setLevel(logging.WARNING)
 from crop_engine import run_yolo_batch  # ← Chinese (with RTL fix)
 from manga_ocr_utils import run_vl_ocr_batch  # ← Upgraded to Qwen-VL
 from text_renderer import add_text  # ← Chinese (with thick outline)
-from translate_manga import translate_manga  # ← Japanese (Sugoi / Qwen3 Local)
+from translate_manga import translate_chunk  # ← NEW: Chunked Ollama API
 from cleaner import process_contour  # ← Chinese (fixes threshold bug)
 
 # ─────────────────────────────────────────────
@@ -56,39 +56,52 @@ def process_page_assembly(original_image_path, bubble_data_list, ocr_results):
     print(f"\n  📄 Processing: {filename}")
 
     # ==========================================
-    # STEP 1: BULK TRANSLATION (GPU 1 Active)
+    # STEP 1: CHUNKED BULK TRANSLATION (GPU 1 Active)
     # ==========================================
     page_translations = {}  # Store translations here
-
+    valid_bubbles = []
+    page_texts = []
+    
+    # 1. Gather all valid text for the page first
     for bubble in bubble_data_list:
         crop_filename = os.path.basename(bubble["crop_path"])
-        original_text = ocr_results.get(crop_filename, "")
+        original_text = ocr_results.get(crop_filename, "").strip()
+        
+        if original_text:
+            valid_bubbles.append(bubble)
+            page_texts.append(original_text)
 
-        # Skip if no text found
-        if not original_text or not original_text.strip():
-            continue
-
-        # Run translation through our optimized model loader
-        english = translate_manga(original_text, target_lang="en")
-
-        # Final sanity check: If it returned text but it's just cursive/corrupt unicode text, wipe it
-        if english and (bool(re.search(r'[\u1d400-\u1d7ff]', english)) or "<think>" in english):
-            english = ""
-
-        if english and english.strip():
-            page_translations[crop_filename] = english
-
-            # Print to terminal
-            clean_orig = original_text.replace('\n', ' ')
-            clean_trans = english.replace('\n', ' ')
-            print(f"      [JP] : {clean_orig}")
-            print(f"      [EN] : {clean_trans}")
-        else:
-            # Fallback print if translation was skipped or suppressed due to an error
-            clean_orig = original_text.replace('\n', ' ')
-            print(f"      [JP] : {clean_orig}")
-            print(f"      [EN] : [Translation Skipped / Empty]")
-
+    # 2. Process in safe chunks of 10 bubbles
+    # This gives the model context, but prevents JSON truncation on large pages
+    CHUNK_SIZE = 10 
+    
+    if page_texts:
+        print(f"   🌐 Translating {len(page_texts)} bubbles in chunks of {CHUNK_SIZE}...")
+        
+        for i in range(0, len(page_texts), CHUNK_SIZE):
+            chunk_texts = page_texts[i : i + CHUNK_SIZE]
+            chunk_bubbles = valid_bubbles[i : i + CHUNK_SIZE]
+            
+            # Get translations for this specific chunk
+            chunk_results = translate_chunk(chunk_texts)
+            
+            # Map results back to filenames
+            for local_idx, bubble in enumerate(chunk_bubbles):
+                crop_filename = os.path.basename(bubble["crop_path"])
+                english = chunk_results.get(str(local_idx), "")
+                
+                # Final sanity check: If it returned text but it's just cursive/corrupt unicode text, wipe it
+                if english and (bool(re.search(r'[\u1d400-\u1d7ff]', english)) or "<think>" in english):
+                    english = ""
+                    
+                page_translations[crop_filename] = english
+                
+                # Terminal logging
+                clean_orig = chunk_texts[local_idx].replace('\n', ' ')
+                clean_trans = english.replace('\n', ' ') if english else "[Skipped/Empty]"
+                print(f"      [JP] : {clean_orig}")
+                print(f"      [EN] : {clean_trans}")
+                
     print("      " + "-" * 40)
 
     # ==========================================
