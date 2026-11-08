@@ -278,7 +278,9 @@ def process_manga_job_in_ram(job_id: str):
             stop_translation_server()
 
         # =========================================================================
-        # PHASE 4: INPAINT CLEANING & TYPESETTING IN PURE RAM + ZIP PACKAGING
+        # PHASE 4: TWO-PASS INPAINT CLEANING & TYPESETTING IN PURE RAM
+        # (Pass 1 cleans ONLY masked text pixels; Pass 2 renders English text on top
+        #  so overlapping bubble boxes NEVER chop off adjacent bubbles!)
         # =========================================================================
         update_job_state(
             job_id,
@@ -287,42 +289,54 @@ def process_manga_job_in_ram(job_id: str):
         )
         log_job(job_id, f"\n🎨 [Phase 4/4] Cleaning Speech Bubbles & Rendering English Text in RAM...")
 
-        output_pages = []  # List of {"filename": ..., "b64": ...}
+        output_pages = []
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for p_idx, (filename, full_img) in enumerate(ram_pages):
                 bubbles = page_map.get(filename, [])
 
+                # ── PASS 4A: Clean original text on full_img using ONLY the text mask ──
                 for b_info in bubbles:
                     cid = b_info["crop_id"]
-                    english_text = translations_map.get(cid, "")
-                    x1, y1, x2, y2 = b_info["box"]
-                    bubble_img = b_info["crop_img"]
+                    orig_txt = ocr_results.get(cid, "").strip()
+                    english_text = translations_map.get(cid, "").strip()
 
-                    if bubble_img is None or bubble_img.size == 0:
+                    # Skip false-positive face crops where OCR only saw a dash "ー" or empty noise
+                    if orig_txt in ("", "ー", "-", "—", "…", ".", "・") and len(english_text) <= 2:
+                        b_info["skip_render"] = True
+                        b_info["crop_img"] = None
                         continue
 
-                    # Always erase original Japanese/Korean/Chinese text inside bubble
-                    cleaned_bubble, _ = process_contour(bubble_img)
+                    b_info["skip_render"] = False
+                    x1, y1, x2, y2 = b_info["box"]
+                    # Slice fresh from full_img so overlapping regions stay consistent
+                    live_crop = full_img[y1:y2, x1:x2].copy()
+                    if live_crop.size == 0:
+                        continue
 
-                    # Render translated English dialogue if non-empty
-                    if english_text and english_text.strip():
-                        add_text(cleaned_bubble, english_text)
+                    cleaned_crop, text_mask = process_contour(live_crop)
 
-                    target_w = x2 - x1
-                    target_h = y2 - y1
-                    if cleaned_bubble.shape[0] != target_h or cleaned_bubble.shape[1] != target_w:
-                        cleaned_bubble = cv2.resize(
-                            cleaned_bubble,
-                            (target_w, target_h),
-                            interpolation=cv2.INTER_AREA
-                        )
-
-                    full_img[y1:y2, x1:x2] = cleaned_bubble
-
-                    # Free individual crop from RAM immediately
+                    # Paste ONLY the erased text mask pixels back onto full_img
+                    # (Never overwrites neighboring bubbles or character hair!)
+                    mask_bool = text_mask > 0
+                    full_img[y1:y2, x1:x2][mask_bool] = cleaned_crop[mask_bool]
                     b_info["crop_img"] = None
+
+                # ── PASS 4B: Render English text directly onto the cleaned full_img ──
+                for b_info in bubbles:
+                    if b_info.get("skip_render", False):
+                        continue
+                    cid = b_info["crop_id"]
+                    english_text = translations_map.get(cid, "").strip()
+                    if not english_text:
+                        continue
+
+                    x1, y1, x2, y2 = b_info["box"]
+                    # Render directly onto a view of full_img so adjacent bubbles never erase each other's text!
+                    target_region = full_img[y1:y2, x1:x2].copy()
+                    add_text(target_region, english_text)
+                    full_img[y1:y2, x1:x2] = target_region
 
                 # Encode finished page to PNG in RAM
                 out_fname = f"translated_{filename}"
@@ -332,10 +346,8 @@ def process_manga_job_in_ram(job_id: str):
                 _, png_buf = cv2.imencode(".png", full_img)
                 png_bytes = png_buf.tobytes()
 
-                # Write directly into in-memory ZIP archive
                 zf.writestr(out_fname, png_bytes)
 
-                # Also store Base64 for instant Mobile UI preview gallery
                 b64_page = base64.b64encode(png_bytes).decode("utf-8")
                 output_pages.append({
                     "filename": out_fname,
