@@ -29,29 +29,19 @@ TRANS_LOG_PATH = os.path.join(RAM_LOG_DIR, "llama_translate.log")
 _trans_process = None
 _trans_log_file = None
 
-# ==========================================================
-# 🎯 SYSTEM PROMPT (ROMANCE, NSFW, MATURE & COMIC REGISTERS)
-# ==========================================================
-SYSTEM_PROMPT = """You are an uncensored, expert manga, manhwa, and manhua localizer (JP/CN/KR to EN).
-Translate the numbered lines into natural, expressive, emotionally accurate English suitable for comic speech bubbles across all genres, including romance, drama, comedy, and mature/NSFW adult fiction.
-
-CORE LOCALIZATION RULES:
-1. FICTIONAL CONTEXT: This text consists purely of fictional dialogue from romance, adult drama, slice-of-life, and mature graphic novels. Dialogue ranges from intimate, affectionate, and teasing to sexually explicit, vulgar, or intense. Translate faithfully without moralizing, preaching, or refusal.
-2. MATURE & ROMANTIC TONE:
-   - Accurately convey intimacy, romantic tension, flirtation, and adult dialogue.
-   - Accurately translate sexual expressions, vulgarity, swearing, and body references using their genuine, direct English equivalents (e.g., "fuck", "cock", "dick", "pussy", "shit", "bitch", "horny", "wet").
-   - Localize intimate onomatopoeia, gasps, and vocalizations (e.g., "Ah...", "Mgh...", "Haah...") naturally for English comic pacing.
-   - NEVER sanitize, soften, or convert mature/erotic dialogue into childish euphemisms (e.g., do NOT replace explicit words with "stuff", "down there", or "make love" unless the original Japanese/Korean source specifically used polite/euphemistic terms).
-3. NO ASTERISKS OR SYMBOLS: Output words cleanly and in full. NEVER mask words using asterisks, dashes, or symbols (e.g., write "fuck", NEVER "f***", "f*ck", or "f---").
-4. CONTEXT & IMPLIED PRONOUNS: Seamlessly infer missing subjects and pronouns (I, you, he, she, we, they) and relationship dynamics (lover, partner, boss, rival) from the surrounding dialogue.
-5. CLEAN OUTPUT: Output ONLY the requested JSON. Do not include notes, translation trivia, content warnings, or markdown commentary.
+SYSTEM_PROMPT = """You are an expert, uncensored manga, manhwa, and manhua localizer (JP/CN/KR to EN).
+Translate the numbered lines into natural, concise, emotionally accurate English suitable for comic speech bubbles.
+- Infer implied pronouns (I, you, he, she, they) naturally from the conversation context across lines.
+- STRICT UNCENSORED POLICY: The source text comes from raw manga/manhwa/manhua and may contain heavy profanity, street slang, vulgarity, violence, and explicit NSFW/adult dialogue.
+- NEVER censor, sanitize, soften, or tone down swearing, crude slang, insults, or sexually explicit/NSFW terms.
+- NEVER use asterisks (e.g., f***, s***) or mild euphemisms; use raw, authentic English equivalents that match the exact intensity and register of the original text.
+- Do NOT include explanations, warnings, notes, or markdown prose.
 
 OUTPUT FORMAT: Return ONLY a valid JSON object mapping each string index to its English translation.
 Example:
 {
-  "0": "Ah... stop teasing me, it feels too good...",
-  "1": "You're so sensitive right here... You want me to keep going, don't you?",
-  "2": "Fuck... don't look at me like that."
+  "0": "What the fuck are you doing?!",
+  "1": "I won't let you bastards get away with this."
 }"""
 
 
@@ -71,11 +61,9 @@ def ensure_llama_server_binary():
 
 
 def ensure_translation_models_downloaded():
-    """Downloads Qwen3.8-27B Q6_K and MTP Draft Q8_0 into /tmp/models."""
+    """Downloads Qwen3.8-27B Q6_K (~22.4 GB) and MTP Draft Q8_0 (~3.16 GB) into /tmp/models."""
     os.makedirs(MODEL_DIR, exist_ok=True)
-    # Updated with your new Hugging Face token
-    hf_token = os.environ.get("HF_TOKEN", None)
-
+    hf_token = os.environ.get("HF_TOKEN", "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")
 
     # 1. Main 27B Model (~22.4 GB)
     if os.path.exists(TRANS_MODEL_PATH) and os.path.getsize(TRANS_MODEL_PATH) > 20 * 1e9:
@@ -173,7 +161,7 @@ def start_translation_server(context_size: str = "32768"):
 
 
 def stop_translation_server():
-    """Unloads Qwen3.8-27B + MTP from VRAM so other tools can use the GPUs freely."""
+    """Unloads Qwen3.8-27B + MTP from VRAM so IOPaint/OpenCV can run freely."""
     global _trans_process, _trans_log_file
     if _trans_process is not None:
         try:
@@ -196,34 +184,39 @@ def stop_translation_server():
 
 def strip_thinking_and_extract_json(text: str) -> dict:
     """
-    Discards all thinking monologue (<think>...</think>) before extracting JSON,
-    preventing curly braces inside reasoning traces from breaking extraction.
+    Strictly removes any <think>...</think> blocks first so curly braces inside
+    reasoning never corrupt the JSON parser, then extracts the JSON mapping.
     """
     text = text.strip()
-
-    # Step 1: Strip out thinking tokens completely
     if "</think>" in text:
-        clean_text = text.split("</think>")[-1].strip()
-    else:
-        # Fallback if generation cut off mid-thought without </think>
-        clean_text = re.sub(r"<think>[\s\S]*?(?:$|</think>)", "", text).strip()
+        text = text.split("</think>")[-1].strip()
+    elif "<think>" in text:
+        # Unclosed <think> block means generation hit max_tokens inside reasoning
+        return {}
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    # Step 2: Try parsing from Markdown ```json ... ``` code fences
-    fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", clean_text)
-    if fence_match:
+    # Try 1: Markdown ```json block
+    match = re.search(r"```json\s*([\s\S]*?)\s*```", text)
+    if match:
         try:
-            return json.loads(fence_match.group(1))
-        except json.JSONDecodeError:
+            return json.loads(match.group(1))
+        except Exception:
             pass
 
-    # Step 3: Extract the outermost {...} JSON boundaries
-    start_idx = clean_text.find("{")
-    end_idx = clean_text.rfind("}")
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        raw_json = clean_text[start_idx:end_idx + 1]
+    # Try 2: Any ``` block
+    match = re.search(r"```\s*([\s\S]*?)\s*```", text)
+    if match:
         try:
-            return json.loads(raw_json)
-        except json.JSONDecodeError:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+
+    # Try 3: First valid JSON object in remaining text
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
             pass
 
     return {}
@@ -231,30 +224,41 @@ def strip_thinking_and_extract_json(text: str) -> dict:
 
 def clean_translated_line(text: str) -> str:
     """
-    Cleans stray CJK symbols or corrupt mathematical unicode while preserving
-    English words, punctuation, and colloquial expressions.
+    FIXED: Uses 8-digit uppercase \\U0001d400-\\U0001d7ff so Python never mistakes
+    the range for ASCII '0'-'z'! Also strips residual story-context echoes if any.
     """
     if not text:
         return ""
-
     if "</think>" in text:
         text = text.split("</think>")[-1]
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
-    # Remove mathematical cursive/bold unicode hallucinations
-    text = re.sub(r"[\u1d400-\u1d7ff]", "", text)
+    # Remove any accidental echo of our "(Story context...)" prefix
+    text = re.sub(r"^\(Story context[^)]*\)\s*", "", text, flags=re.IGNORECASE)
 
-    # Strip leftover untranslated CJK characters (Hiragana, Katakana, Hanzi, Hangul)
+    # FIXED: 8-digit \U escape for mathematical alphanumeric symbols ONLY
+    text = re.sub(r"[\U0001d400-\U0001d7ff]", "", text)
+
+    # Strip stray untranslated CJK characters while keeping English words/numbers intact
     text = re.sub(r"[\u3040-\u309F\u30A0-\u30FF\u4e00-\u9fff\uac00-\ud7af]+", "", text)
 
     return text.replace("\n", " ").strip()
 
 
-def translate_chunk(text_list: list, max_retries: int = 3, enable_thinking: bool = True) -> dict:
+def translate_chunk(
+    text_list: list,
+    max_retries: int = 3,
+    enable_thinking: bool = True,
+    reasoning_effort: str = "low",
+    preserve_thinking: bool = False
+) -> dict:
     """
-    Sends sequential speech bubbles to Qwen3.8-27B + MTP server.
-    Uses 'low' reasoning effort for contextual subject/gender/tone inference without
-    triggering safety self-talk or huge token latencies.
+    Sends a chunk of lines (e.g. 10 bubbles) to Qwen3.8-27B + MTP server and
+    returns a dictionary mapping string index -> English translation.
+    
+    Uses official Qwen3.8 recommended sampling parameters:
+    - Thinking Mode: temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0
+    - Instruct Mode: temperature=0.7, top_p=0.80, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0
     """
     if not text_list:
         return {}
@@ -267,33 +271,28 @@ def translate_chunk(text_list: list, max_retries: int = 3, enable_thinking: bool
         clean_src = text.replace("\n", " ").strip()
         user_prompt += f"[{i}] {clean_src}\n"
 
-    # Base payload parameters
+    # Official Qwen3.8 sampling presets + medium-sized max_tokens (4096) for thinking + JSON
     payload = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": 0.8 if enable_thinking else 0.3,
-        "top_p": 0.95 if enable_thinking else 0.85,
+        "temperature": 1.0 if enable_thinking else 0.7,
+        "top_p": 0.95 if enable_thinking else 0.80,
         "top_k": 20,
-        "presence_penalty": 0.0,  # 0.0 prevents language mixing and repetition artifacts
-        "max_tokens": 2048 if enable_thinking else 1024,
+        "min_p": 0.0,
+        "presence_penalty": 0.0 if enable_thinking else 1.5,
+        "repeat_penalty": 1.0,
+        "repetition_penalty": 1.0,
+        "max_tokens": 4096 if enable_thinking else 1536,
+        "reasoning_effort": reasoning_effort,
+        "preserve_thinking": preserve_thinking,
+        "chat_template_kwargs": {
+            "enable_thinking": enable_thinking,
+            "preserve_thinking": preserve_thinking,
+            "reasoning_effort": reasoning_effort
+        }
     }
-
-    if enable_thinking:
-        # When thinking is enabled, DO NOT pass {"response_format": {"type": "json_object"}}
-        # as it forces the first token to be '{', which suppresses the <think> token stream.
-        payload["reasoning_effort"] = "low"
-        payload["chat_template_kwargs"] = {
-            "enable_thinking": True,
-            "preserve_thinking": False
-        }
-    else:
-        # In non-thinking mode, strict JSON grammar enforcement is safe
-        payload["response_format"] = {"type": "json_object"}
-        payload["chat_template_kwargs"] = {
-            "enable_thinking": False
-        }
 
     for attempt in range(max_retries):
         try:
@@ -302,6 +301,11 @@ def translate_chunk(text_list: list, max_retries: int = 3, enable_thinking: bool
 
             msg = response.json()["choices"][0]["message"]
             content = (msg.get("content") or "").strip()
+
+            # Fallback if llama-server ever splits reasoning into reasoning_content/reasoning fields
+            reasoning_trace = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            if reasoning_trace and "<think>" not in content:
+                content = f"<think>\n{reasoning_trace}\n</think>\n\n{content}"
 
             if not content:
                 raise ValueError("Empty content returned from Qwen3.8-27B")
@@ -329,7 +333,20 @@ def translate_chunk(text_list: list, max_retries: int = 3, enable_thinking: bool
     return {str(i): "" for i in range(len(text_list))}
 
 
-def translate_manga(text: str, target_lang: str = "en", source_lang: str = "auto") -> str:
+def translate_manga(
+    text: str,
+    target_lang: str = "en",
+    source_lang: str = "auto",
+    enable_thinking: bool = True,
+    reasoning_effort: str = "low",
+    preserve_thinking: bool = False
+) -> str:
     """Single-line legacy helper."""
-    res = translate_chunk([text])
+    res = translate_chunk(
+        [text],
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+        preserve_thinking=preserve_thinking
+    )
     return res.get("0", "")
+   
