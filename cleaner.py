@@ -1,10 +1,9 @@
 """
 cleaner.py
-Processes cropped speech bubbles in Pure RAM.
-UPGRADED:
-  1. Port moved to 8085 so it never conflicts with llama-server (8080).
-  2. Interior Border-Safe Canny Masking: Prevents erasing the speech bubble's own black outline!
-  3. Automatic fast fallback to OpenCV Telea inpainting + solid white interior fill if IOPaint is offline.
+UPGRADED AFTER VISUAL TEST:
+  1. Fixed 6px border margin (instead of 8% height) so text near the top/bottom tips of tall bubbles is 100% erased!
+  2. Smart Bubble Interior Fill: If text is inside a clean white/solid speech bubble, fills with pure bubble background color instead of blurry Telea smudging!
+  3. Returns the exact inpaint `mask` so main.py only replaces masked text pixels (preventing overlapping bounding boxes from chopping off adjacent bubbles!).
 """
 from typing import Tuple
 import cv2
@@ -12,50 +11,83 @@ import numpy as np
 import requests
 import base64
 
-# IOPaint server runs on 8085 (llama-server uses 8080)
 IOPAINT_URL = "http://127.0.0.1:8085/api/v1/inpaint"
 
 
 def create_smart_mask(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Creates an inpainting mask targeting ONLY the text inside the speech bubble,
-    while protecting the outer speech bubble border and surrounding artwork.
+    Detects text strokes inside the crop while protecting only the outer 6px padding ring.
     """
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # 1. Detect sharp edges (works on both black-on-white and white-on-black text)
-    edges = cv2.Canny(gray, 50, 150)
+    # 1. Detect both dark text on light bubbles AND light text on dark backgrounds
+    edges = cv2.Canny(gray, 45, 140)
 
-    # 2. Protect the outer padding / bubble border wall!
-    # Since crop_engine adds 10px padding around the box, the bubble outline sits near the edges.
-    margin_x = max(4, int(w * 0.08))
-    margin_y = max(4, int(h * 0.08))
+    # Also catch solid dark ink strokes inside bright speech bubbles directly
+    # (prevents hollow thick characters like on the green book cover from leaving unmasked centers)
+    bg_median = np.median(gray)
+    if bg_median > 180:
+        _, dark_ink = cv2.threshold(gray, int(bg_median * 0.72), 255, cv2.THRESH_BINARY_INV)
+        edges = cv2.bitwise_or(edges, dark_ink)
 
-    # Zero out Canny edges inside the outer margin ring so bubble walls aren't dilated into the mask
+    # 2. Fixed 6px outer margin (protects the 10px YOLO padding border without missing bottom characters like ねー？)
+    margin = min(6, h // 6, w // 6)
     interior_edges = np.zeros_like(edges)
-    interior_edges[margin_y:h - margin_y, margin_x:w - margin_x] = edges[margin_y:h - margin_y, margin_x:w - margin_x]
-
-    # 3. Dilate interior text edges into solid character blocks
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.dilate(interior_edges, kernel, iterations=2)
-
-    # 4. Compute usable interior contour for reference
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
+    if h > 2 * margin and w > 2 * margin:
+        interior_edges[margin:h - margin, margin:w - margin] = edges[margin:h - margin, margin:w - margin]
     else:
-        largest_contour = np.array(
-            [[[margin_x, margin_y]], [[w - margin_x, margin_y]],
-             [[w - margin_x, h - margin_y]], [[margin_x, h - margin_y]]],
-            dtype=np.int32
-        )
+        interior_edges = edges
 
-    return mask, largest_contour
+    # 3. Remove connected components that touch the outer margin boundary (speech bubble walls!)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(interior_edges, connectivity=8)
+    filtered_edges = np.zeros_like(interior_edges)
+    for lbl in range(1, num_labels):
+        x, y, cw, ch, area = stats[lbl]
+        touches_border = (
+            x <= margin + 1 or
+            y <= margin + 1 or
+            (x + cw) >= (w - margin - 1) or
+            (y + ch) >= (h - margin - 1)
+        )
+        # If a long contour touches the border, it's the bubble outline wall or panel frame -> skip it!
+        if touches_border and (cw > w * 0.45 or ch > h * 0.45):
+            continue
+        filtered_edges[labels == lbl] = 255
+
+    # 4. Dilate text strokes so anti-aliased fringes are completely covered
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.dilate(filtered_edges, kernel, iterations=2)
+
+    return mask, mask
+
+
+def smart_local_inpaint(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Cleanly erases text without smudging dark buildings/borders into white speech bubbles.
+    """
+    cleaned = image.copy()
+
+    # Find pixels just outside the text mask to sample the true local bubble background color
+    dilate_ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+    ring_mask = cv2.subtract(dilate_ring, mask)
+
+    ring_pixels = image[ring_mask > 0]
+    if len(ring_pixels) > 20:
+        median_bgr = np.median(ring_pixels, axis=0).astype(np.uint8)
+        std_bgr = np.std(ring_pixels, axis=0).mean()
+
+        # If the surrounding interior is a uniform speech bubble (e.g. white/cream bubble),
+        # fill directly with the clean median bubble color so zero dark smudges appear!
+        if std_bgr < 28 or np.mean(median_bgr) > 220:
+            cleaned[mask > 0] = median_bgr
+            return cleaned
+
+    # For textured/colored backgrounds (like book covers), use Navier-Stokes / Telea inpainting
+    return cv2.inpaint(image, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
 
 
 def cv2_to_base64(img: np.ndarray) -> str:
-    """Encodes an OpenCV numpy array to a Base64 PNG data URL in RAM."""
     _, buffer = cv2.imencode('.png', img)
     b64_str = base64.b64encode(buffer).decode('utf-8')
     return f"data:image/png;base64,{b64_str}"
@@ -63,33 +95,28 @@ def cv2_to_base64(img: np.ndarray) -> str:
 
 def process_contour(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Sends the in-memory cropped bubble and border-safe text mask to IOPaint (port 8085).
-    Falls back cleanly to OpenCV Telea inpainting if IOPaint is not running.
+    Returns (cleaned_image, text_mask).
+    Note: Returning `mask` allows main.py to composite ONLY the erased text pixels
+    so overlapping speech bubble boxes never chop off neighboring bubbles!
     """
-    mask, largest_contour = create_smart_mask(image)
+    mask, _ = create_smart_mask(image)
 
-    # If the mask is completely empty (no text edges found), return image untouched
     if cv2.countNonZero(mask) == 0:
-        return image.copy(), largest_contour
+        return image.copy(), mask
 
     try:
         payload = {
             "image": cv2_to_base64(image),
             "mask": cv2_to_base64(mask),
         }
-
-        response = requests.post(IOPAINT_URL, json=payload, timeout=30)
-
+        response = requests.post(IOPAINT_URL, json=payload, timeout=15)
         if response.status_code == 200:
             result_bytes = np.frombuffer(response.content, np.uint8)
             cleaned_image = cv2.imdecode(result_bytes, cv2.IMREAD_COLOR)
             if cleaned_image is not None:
-                return cleaned_image, largest_contour
-
-        # Fallback if non-200 status
-        return cv2.inpaint(image, mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA), largest_contour
-
+                return cleaned_image, mask
     except requests.exceptions.RequestException:
-        # Clean silent fallback to OpenCV Telea when IOPaint server isn't active
-        return cv2.inpaint(image, mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA), largest_contour
-        
+        pass
+
+    return smart_local_inpaint(image, mask), mask
+  
