@@ -1,9 +1,10 @@
 """
 cleaner.py
-UPGRADED AFTER VISUAL TEST:
-  1. Fixed 6px border margin (instead of 8% height) so text near the top/bottom tips of tall bubbles is 100% erased!
-  2. Smart Bubble Interior Fill: If text is inside a clean white/solid speech bubble, fills with pure bubble background color instead of blurry Telea smudging!
-  3. Returns the exact inpaint `mask` so main.py only replaces masked text pixels (preventing overlapping bounding boxes from chopping off adjacent bubbles!).
+UPGRADED FOR PERFECT OVAL BUBBLE PROTECTION (COLOR + B&W MANGA):
+  1. Elliptical Interior Safe-Zone: Prevents rectangular YOLO boxes from spilling white paint
+     over the 4 corners outside oval speech bubbles (protects hair, chins, glasses, buildings!).
+  2. Direct Dark-Ink & Light-Ink Stroke Masking inside the bubble interior.
+  3. Clean paper-matched background fill (matches pure white OR aged B&W manga paper tone).
 """
 from typing import Tuple
 import cv2
@@ -16,75 +17,88 @@ IOPAINT_URL = "http://127.0.0.1:8085/api/v1/inpaint"
 
 def create_smart_mask(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Detects text strokes inside the crop while protecting only the outer 6px padding ring.
+    Detects ONLY the text characters inside the oval speech bubble interior,
+    strictly ignoring the 4 outer corners of the rectangular crop and the bubble's black border.
     """
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # 1. Detect both dark text on light bubbles AND light text on dark backgrounds
-    edges = cv2.Canny(gray, 45, 140)
+    # 1. Build an Elliptical Interior Safe Mask that matches oval manga speech bubbles!
+    # This automatically excludes the 4 rectangular corners outside the oval bubble
+    # (where character hair, faces, glasses, and buildings sit).
+    ellipse_mask = np.zeros((h, w), dtype=np.uint8)
+    center = (w // 2, h // 2)
+    axes = (max(4, int(w * 0.44)), max(4, int(h * 0.45)))
+    cv2.ellipse(ellipse_mask, center, axes, 0, 0, 360, 255, -1)
 
-    # Also catch solid dark ink strokes inside bright speech bubbles directly
-    # (prevents hollow thick characters like on the green book cover from leaving unmasked centers)
-    bg_median = np.median(gray)
-    if bg_median > 180:
-        _, dark_ink = cv2.threshold(gray, int(bg_median * 0.72), 255, cv2.THRESH_BINARY_INV)
-        edges = cv2.bitwise_or(edges, dark_ink)
+    # 2. Sample the bubble interior brightness inside the ellipse
+    interior_pixels = gray[ellipse_mask > 0]
+    bg_median = float(np.median(interior_pixels)) if len(interior_pixels) > 0 else 240.0
 
-    # 2. Fixed 6px outer margin (protects the 10px YOLO padding border without missing bottom characters like ねー？)
-    margin = min(6, h // 6, w // 6)
-    interior_edges = np.zeros_like(edges)
-    if h > 2 * margin and w > 2 * margin:
-        interior_edges[margin:h - margin, margin:w - margin] = edges[margin:h - margin, margin:w - margin]
+    # 3. Detect text strokes based on whether this is a normal light bubble (B&W or Color)
+    #    or an inverted dark bubble
+    if bg_median >= 150:
+        # Standard white / cream / aged B&W paper bubble with dark text:
+        # Catch all dark ink pixels darker than 78% of the bubble's paper brightness
+        thresh_val = int(bg_median * 0.78)
+        _, raw_text_mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
     else:
-        interior_edges = edges
+        # Dark bubble or dark background with bright/outlined text:
+        edges = cv2.Canny(gray, 50, 150)
+        raw_text_mask = edges
 
-    # 3. Remove connected components that touch the outer margin boundary (speech bubble walls!)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(interior_edges, connectivity=8)
-    filtered_edges = np.zeros_like(interior_edges)
+    # Restrict strictly to inside the oval ellipse safe-zone
+    interior_text = cv2.bitwise_and(raw_text_mask, ellipse_mask)
+
+    # 4. Connected-Components Filter:
+    # Keep character-sized blobs; drop any long line that touches the ellipse boundary
+    # (such as an overlapping neighboring bubble wall or panel line).
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(interior_text, connectivity=8)
+    clean_text_mask = np.zeros_like(interior_text)
+
     for lbl in range(1, num_labels):
         x, y, cw, ch, area = stats[lbl]
-        touches_border = (
-            x <= margin + 1 or
-            y <= margin + 1 or
-            (x + cw) >= (w - margin - 1) or
-            (y + ch) >= (h - margin - 1)
-        )
-        # If a long contour touches the border, it's the bubble outline wall or panel frame -> skip it!
-        if touches_border and (cw > w * 0.45 or ch > h * 0.45):
+        if area < 3:
             continue
-        filtered_edges[labels == lbl] = 255
+        # If a single connected component spans more than 65% of the entire bubble width or height,
+        # it is a speech bubble border line or artwork line, NOT a Japanese character!
+        if cw > w * 0.65 or ch > h * 0.65:
+            continue
+        clean_text_mask[labels == lbl] = 255
 
-    # 4. Dilate text strokes so anti-aliased fringes are completely covered
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.dilate(filtered_edges, kernel, iterations=2)
+    # 5. Moderate dilation (5x5 instead of 7x7x2) to cover anti-aliased text halos
+    # without ballooning outside the bubble
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.dilate(clean_text_mask, kernel, iterations=1)
+
+    # Final clip against the ellipse so dilation never crosses the bubble wall
+    mask = cv2.bitwise_and(mask, ellipse_mask)
 
     return mask, mask
 
 
 def smart_local_inpaint(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
-    Cleanly erases text without smudging dark buildings/borders into white speech bubbles.
+    Replaces masked text strokes with the exact local bubble paper color (for light bubbles)
+    or smooth Telea inpainting (for complex colored backgrounds).
     """
     cleaned = image.copy()
 
-    # Find pixels just outside the text mask to sample the true local bubble background color
-    dilate_ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+    # Sample background pixels immediately surrounding the text characters
+    dilate_ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
     ring_mask = cv2.subtract(dilate_ring, mask)
 
     ring_pixels = image[ring_mask > 0]
-    if len(ring_pixels) > 20:
+    if len(ring_pixels) > 15:
         median_bgr = np.median(ring_pixels, axis=0).astype(np.uint8)
         std_bgr = np.std(ring_pixels, axis=0).mean()
 
-        # If the surrounding interior is a uniform speech bubble (e.g. white/cream bubble),
-        # fill directly with the clean median bubble color so zero dark smudges appear!
-        if std_bgr < 28 or np.mean(median_bgr) > 220:
+        # Works for both pure white bubbles AND aged/greyish B&W manga scans!
+        if std_bgr < 32 and np.mean(median_bgr) > 175:
             cleaned[mask > 0] = median_bgr
             return cleaned
 
-    # For textured/colored backgrounds (like book covers), use Navier-Stokes / Telea inpainting
-    return cv2.inpaint(image, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+    return cv2.inpaint(image, mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
 
 
 def cv2_to_base64(img: np.ndarray) -> str:
@@ -95,9 +109,7 @@ def cv2_to_base64(img: np.ndarray) -> str:
 
 def process_contour(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Returns (cleaned_image, text_mask).
-    Note: Returning `mask` allows main.py to composite ONLY the erased text pixels
-    so overlapping speech bubble boxes never chop off neighboring bubbles!
+    Cleans text inside the bubble and returns (cleaned_image, text_mask).
     """
     mask, _ = create_smart_mask(image)
 
