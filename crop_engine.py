@@ -18,10 +18,8 @@ def sort_boxes_reading_order(boxes: np.ndarray, page_height: int, rtl: bool = Tr
     if len(boxes) == 0:
         return []
 
-    # Dynamic vertical threshold (~7% of page height)
     row_threshold = max(50, int(page_height * 0.07))
 
-    # Sort by vertical center
     box_list = list(boxes)
     box_list.sort(key=lambda b: (b[1] + b[3]) / 2.0)
 
@@ -44,7 +42,6 @@ def sort_boxes_reading_order(boxes: np.ndarray, page_height: int, rtl: bool = Tr
         if not placed:
             rows.append([box])
 
-    # Sort each row horizontally
     ordered_boxes = []
 
     for row in rows:
@@ -56,50 +53,6 @@ def sort_boxes_reading_order(boxes: np.ndarray, page_height: int, rtl: bool = Tr
         ordered_boxes.extend(row)
 
     return ordered_boxes
-
-
-def filter_tiny_boxes(
-    boxes: np.ndarray,
-    page_width: int,
-    page_height: int
-) -> np.ndarray:
-    """
-    Remove detections that are too small to be useful speech bubbles.
-
-    Minimum dimensions adapt to the page resolution:
-      - Minimum width:  max(24 pixels, 2% of page width)
-      - Minimum height: max(20 pixels, 1.5% of page height)
-      - Minimum area:   max(600 pixels, 0.04% of page area)
-
-    These filters help reject small facial-feature detections.
-    """
-    if boxes is None or len(boxes) == 0:
-        return np.empty((0, 4), dtype=np.float32)
-
-    min_width = max(24, int(page_width * 0.02))
-    min_height = max(20, int(page_height * 0.015))
-    min_area = max(600, int(page_width * page_height * 0.0004))
-
-    filtered = []
-
-    for box in boxes:
-        x1, y1, x2, y2 = box
-
-        box_width = x2 - x1
-        box_height = y2 - y1
-        box_area = box_width * box_height
-
-        if (
-            box_width >= min_width
-            and box_height >= min_height
-            and box_area >= min_area
-        ):
-            filtered.append(box)
-
-    if not filtered:
-        return np.empty((0, 4), dtype=np.float32)
-
-    return np.array(filtered, dtype=np.float32)
 
 
 def run_yolo_ram_batch(
@@ -170,8 +123,8 @@ def run_yolo_ram_batch(
             height, width = full_img.shape[:2]
 
             try:
-                # Run YOLO inference directly on the RAM image.
-                # Increased confidence from 0.22 to 0.40.
+                # FIXED: Increased YOLO confidence from 0.22 to 0.40.
+                # Helps reduce false detections on facial features.
                 results = model(
                     full_img,
                     verbose=False,
@@ -186,17 +139,7 @@ def run_yolo_ram_batch(
 
                     boxes = result.boxes.xyxy.cpu().numpy()
 
-                    # Filter tiny detections before reading-order sorting.
-                    boxes = filter_tiny_boxes(
-                        boxes,
-                        page_width=width,
-                        page_height=height
-                    )
-
-                    if len(boxes) == 0:
-                        continue
-
-                    # Apply Manga RTL or Manhwa LTR reading order.
+                    # Sort detections into Manga RTL / Manhwa LTR order.
                     sorted_boxes = sort_boxes_reading_order(
                         boxes,
                         height,
@@ -205,6 +148,12 @@ def run_yolo_ram_batch(
 
                     for i, box in enumerate(sorted_boxes):
                         x1, y1, x2, y2 = map(int, box)
+
+                        # FIXED: Skip tiny false-positive detections.
+                        # Minimum width: 24 pixels.
+                        # Minimum height: 24 pixels.
+                        if (x2 - x1) < 24 or (y2 - y1) < 24:
+                            continue
 
                         # Apply safe padding within image boundaries.
                         x1 = max(0, x1 - PADDING)
@@ -299,4 +248,3 @@ def run_yolo_batch(
         model_path=model_path,
         rtl=rtl
     )
-    
