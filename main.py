@@ -67,7 +67,7 @@ from text_renderer import add_text
 FLASK_PORT = 5000
 YOLO_MODEL_PATH = os.environ.get(
     "YOLO_MODEL_PATH",
-    "/kaggle/input/models/rohith7boi/yolov8/pytorch/default/1/best.pt"
+    "/kaggle/working/best.pt"
 )
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
