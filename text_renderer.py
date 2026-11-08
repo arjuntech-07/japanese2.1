@@ -4,12 +4,11 @@ Renders translated English text into a cleaned manga/manhwa speech bubble in Pur
 UPGRADED:
   1. True pixel-width word wrapping (never clips off left/right bubble edges).
   2. Checks both horizontal width and vertical height when auto-sizing font.
-  3. Never deletes/truncates the last line of dialogue.
+  3. Auto-detects Dark/Black speech bubbles and flips to crisp White text with a Black halo!
   4. Auto-fetches a clean comic font into /tmp/fonts if no local manga font is mounted.
 """
 import os
 import urllib.request
-import unicodedata
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import cv2
@@ -48,12 +47,10 @@ def get_font_path(style: str = "regular") -> str:
         if os.path.exists(path):
             return path
 
-    # Try auto-downloaded comic font in /tmp/fonts
     dl_font = ensure_fallback_comic_font()
     if dl_font:
         return dl_font
 
-    # Linux / Windows / Mac system fallbacks
     sys_fallbacks = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
@@ -95,6 +92,7 @@ def wrap_text_pixel_width(text: str, draw: ImageDraw.ImageDraw, font: ImageFont.
 def add_text(image: np.ndarray, text: str):
     """
     Draws centered, outlined English comic text inside the in-memory `image` (numpy BGR array).
+    Automatically uses black text on light bubbles and white text on dark/black bubbles.
     Modifies `image` in-place.
     """
     if not text or not text.strip():
@@ -107,7 +105,7 @@ def add_text(image: np.ndarray, text: str):
     pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
 
-    # Safe interior padding (12% horizontal/vertical so text stays comfortably inside oval bubbles)
+    # Safe interior padding (12% horizontal/vertical so text stays comfortably inside bubbles)
     pad_x = max(6, int(w * 0.12))
     pad_y = max(6, int(h * 0.12))
     avail_w = max(12, w - 2 * pad_x)
@@ -150,9 +148,17 @@ def add_text(image: np.ndarray, text: str):
 
         font_size -= 1
 
-    # Crisp white halo outline around black text
-    text_col = (15, 15, 15)
-    outline_col = (255, 255, 255)
+    # Auto-detect Dark/Black speech bubbles and invert text/halo colors
+    center_crop = cv2.cvtColor(image[h // 4: 3 * h // 4, w // 4: 3 * w // 4], cv2.COLOR_BGR2GRAY)
+    is_dark_bubble = (float(np.median(center_crop)) < 115.0) if center_crop.size > 0 else False
+
+    if is_dark_bubble:
+        text_col = (248, 248, 248)     # Crisp white text for dark/black bubbles
+        outline_col = (15, 15, 15)     # Dark black halo outline
+    else:
+        text_col = (15, 15, 15)        # Crisp black text for light bubbles
+        outline_col = (255, 255, 255)  # Crisp white halo outline
+
     stroke_width = max(2, min(4, font_size // 10))
 
     total_block_h = len(lines) * line_height
@@ -163,7 +169,6 @@ def add_text(image: np.ndarray, text: str):
         lw = draw.textlength(ln, font=font)
         x = pad_x + max(0, (avail_w - lw) / 2.0)
 
-        # Use Pillow's native stroke_width for smooth circular outlines
         try:
             draw.text(
                 (x, y),
@@ -174,7 +179,6 @@ def add_text(image: np.ndarray, text: str):
                 stroke_fill=outline_col
             )
         except TypeError:
-            # Fallback if default bitmap font is used
             for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 draw.text((x + dx, y + dy), ln, fill=outline_col, font=font)
             draw.text((x, y), ln, fill=text_col, font=font)
@@ -183,4 +187,4 @@ def add_text(image: np.ndarray, text: str):
 
     # Copy rendered result back into the OpenCV BGR numpy array in-place
     image[:, :, :] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-    
+  
