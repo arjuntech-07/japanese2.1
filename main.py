@@ -1,10 +1,10 @@
 # main.py
 """
-Pure-RAM Manga / Manhwa / Manhua Translation Server & Mobile Web UI
+Pure-RAM Manga / Manhwa / Manhua Translation Server & Modern Mobile Web UI
 - Zero Disk Touch for Images: Uploads -> RAM -> GPU VRAM -> RAM -> Mobile Download -> Auto-Wipe
 - OCR Engine: Qwen 3.5 9B Uncensored Q8_0 + BF16 mmproj (Thinking OFF)
 - Translation Engine: Qwen 3.8 27B Uncensored OrcaRouter Q6_K + MTP Companion (Context-Aware)
-- Multi-Job Queue: Upload multiple folders/chapters back-to-back from mobile with live progress
+- Fast Binary Streaming: Lightweight JSON polling + Dedicated Binary ZIP & Single-Page Endpoints
 """
 import os
 import sys
@@ -18,7 +18,6 @@ import zipfile
 import queue
 import threading
 import subprocess
-import base64
 import logging
 import cv2
 import torch
@@ -78,7 +77,7 @@ DISCORD_WEBHOOK_URL = os.environ.get(
 # IN-MEMORY JOB QUEUE & RAM STORE (NEVER TOUCHES DISK)
 # ─────────────────────────────────────────────────────────────
 JOB_QUEUE = queue.Queue()
-JOBS_RAM = {}  # { job_id: { status, phase, progress, logs, pages_in_ram, out_pages_b64, zip_bytes, ... } }
+JOBS_RAM = {}  # { job_id: { status, phase, progress, logs, pages_in_ram, out_pages_bytes, zip_bytes, ... } }
 JOBS_LOCK = threading.Lock()
 
 
@@ -110,7 +109,7 @@ def free_job_ram(job_id: str):
 
 
 # ─────────────────────────────────────────────────────────────
-# 4-PHASE SEQUENTIAL PURE-RAM PIPELINE WORKER
+# 4-PHASE SEQUENTIAL PURE-RAM PIPELINE WORKER (UNTOUCHED PIPELINE)
 # ─────────────────────────────────────────────────────────────
 def process_manga_job_in_ram(job_id: str):
     with JOBS_LOCK:
@@ -239,14 +238,13 @@ def process_manga_job_in_ram(job_id: str):
                 raise RuntimeError("Failed to start Qwen 3.8 27B translation llama-server.")
 
             CHUNK_SIZE = 10
-            rolling_context = []  # Holds last 4 translated pairs for cross-chunk pronoun/story memory!
+            rolling_context = []
             total_chunks = (len(valid_texts) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
             for c_idx, i in enumerate(range(0, len(valid_texts), CHUNK_SIZE)):
                 chunk_texts = valid_texts[i: i + CHUNK_SIZE]
                 chunk_cids = valid_crop_ids[i: i + CHUNK_SIZE]
 
-                # Prepend rolling context hint to first line if available so 27B keeps story continuity
                 if rolling_context:
                     ctx_header = " | ".join(rolling_context[-4:])
                     chunk_with_ctx = list(chunk_texts)
@@ -279,8 +277,6 @@ def process_manga_job_in_ram(job_id: str):
 
         # =========================================================================
         # PHASE 4: TWO-PASS INPAINT CLEANING & TYPESETTING IN PURE RAM
-        # (Pass 1 cleans ONLY masked text pixels; Pass 2 renders English text on top
-        #  so overlapping bubble boxes NEVER chop off adjacent bubbles!)
         # =========================================================================
         update_job_state(
             job_id,
@@ -292,7 +288,8 @@ def process_manga_job_in_ram(job_id: str):
         output_pages = []
         zip_buffer = io.BytesIO()
 
-        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # Use ZIP_STORED or fast level=1 because PNGs are already compressed! (Saves CPU & sends faster)
+        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_STORED) as zf:
             for p_idx, (filename, full_img) in enumerate(ram_pages):
                 bubbles = page_map.get(filename, [])
 
@@ -302,7 +299,6 @@ def process_manga_job_in_ram(job_id: str):
                     orig_txt = ocr_results.get(cid, "").strip()
                     english_text = translations_map.get(cid, "").strip()
 
-                    # Skip false-positive face crops where OCR only saw a dash "ー" or empty noise
                     if orig_txt in ("", "ー", "-", "—", "…", ".", "・") and len(english_text) <= 2:
                         b_info["skip_render"] = True
                         b_info["crop_img"] = None
@@ -310,15 +306,12 @@ def process_manga_job_in_ram(job_id: str):
 
                     b_info["skip_render"] = False
                     x1, y1, x2, y2 = b_info["box"]
-                    # Slice fresh from full_img so overlapping regions stay consistent
                     live_crop = full_img[y1:y2, x1:x2].copy()
                     if live_crop.size == 0:
                         continue
 
                     cleaned_crop, text_mask = process_contour(live_crop)
 
-                    # Paste ONLY the erased text mask pixels back onto full_img
-                    # (Never overwrites neighboring bubbles or character hair!)
                     mask_bool = text_mask > 0
                     full_img[y1:y2, x1:x2][mask_bool] = cleaned_crop[mask_bool]
                     b_info["crop_img"] = None
@@ -333,25 +326,24 @@ def process_manga_job_in_ram(job_id: str):
                         continue
 
                     x1, y1, x2, y2 = b_info["box"]
-                    # Render directly onto a view of full_img so adjacent bubbles never erase each other's text!
                     target_region = full_img[y1:y2, x1:x2].copy()
                     add_text(target_region, english_text)
                     full_img[y1:y2, x1:x2] = target_region
 
-                # Encode finished page to PNG in RAM
                 out_fname = f"translated_{filename}"
                 if not out_fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                     out_fname += ".png"
 
-                _, png_buf = cv2.imencode(".png", full_img)
+                # Fast PNG encoding in RAM
+                _, png_buf = cv2.imencode(".png", full_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 png_bytes = png_buf.tobytes()
 
                 zf.writestr(out_fname, png_bytes)
 
-                b64_page = base64.b64encode(png_bytes).decode("utf-8")
+                # Store raw binary bytes in RAM (NOT giant Base64 strings inside JSON!)
                 output_pages.append({
                     "filename": out_fname,
-                    "b64": b64_page
+                    "bytes": png_bytes
                 })
 
                 pct = 82 + int(((p_idx + 1) / total_pages) * 18)
@@ -365,13 +357,14 @@ def process_manga_job_in_ram(job_id: str):
         zip_buffer.seek(0)
         elapsed = int(time.time() - start_ts)
 
-        # Wipe raw input numpy arrays from RAM immediately; keep only output until user downloads
         with JOBS_LOCK:
             if job_id in JOBS_RAM:
                 JOBS_RAM[job_id]["pages_in_ram"] = []
                 JOBS_RAM[job_id]["out_pages"] = output_pages
                 JOBS_RAM[job_id]["zip_bytes"] = zip_buffer.getvalue()
                 JOBS_RAM[job_id]["status"] = "done"
+                JOBS_RAM[job_id]["elapsed"] = elapsed
+                JOBS_RAM[job_id]["total_bubbles"] = total_bubbles
                 JOBS_RAM[job_id]["phase"] = f"✅ Completed {total_pages} pages ({total_bubbles} bubbles) in {elapsed}s!"
                 JOBS_RAM[job_id]["progress"] = 100
 
@@ -403,7 +396,7 @@ def background_queue_daemon():
 
 
 # ─────────────────────────────────────────────────────────────
-# MOBILE WEB UI (HTML5 + FOLDER/MULTI-FILE UPLOAD + LIVE QUEUE)
+# MODERN GLASSMORPHISM MOBILE WEB UI (3 SEPARATE VIEWS + FAST STREAMING)
 # ─────────────────────────────────────────────────────────────
 HTML_UI = """
 <!DOCTYPE html>
@@ -411,89 +404,374 @@ HTML_UI = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Manga/Manhwa RAM Translator</title>
+<title>MangaAI Studio • Pure RAM Translator</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  body { background: #0b0f19; color: #e2e8f0; padding: 14px; display: flex; flex-direction: column; align-items: center; }
-  .container { width: 100%; max-width: 600px; }
-  h1 { font-size: 1.25rem; font-weight: 800; color: #f8fafc; text-align: center; margin-bottom: 4px; }
-  .badge { background: #1e293b; color: #38bdf8; font-size: 0.7rem; padding: 3px 8px; border-radius: 99px; border: 1px solid #38bdf844; vertical-align: middle; }
-  .sub { font-size: 0.76rem; color: #94a3b8; text-align: center; margin-bottom: 14px; }
-  .card { background: #131c2e; border: 1px solid #263554; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-  label { font-size: 0.8rem; font-weight: 600; color: #93c5fd; display: block; margin-bottom: 6px; }
-  .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
-  .file-btn { background: #1e293b; border: 1px dashed #475569; border-radius: 8px; padding: 12px 8px; text-align: center; cursor: pointer; font-size: 0.8rem; color: #cbd5e1; font-weight: 600; }
-  .file-btn:hover { border-color: #38bdf8; color: #fff; }
+  :root {
+    --bg-main: #07090e;
+    --bg-card: rgba(17, 24, 39, 0.85);
+    --bg-inner: rgba(11, 15, 25, 0.9);
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-glow: rgba(139, 92, 246, 0.45);
+    --accent-primary: #8b5cf6;
+    --accent-secondary: #06b6d4;
+    --accent-success: #10b981;
+    --accent-warn: #f59e0b;
+    --accent-danger: #ef4444;
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #07090e 55%);
+    background-attachment: fixed;
+    color: var(--text-main);
+    min-height: 100vh;
+    padding: 14px 12px 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .container { width: 100%; max-width: 640px; }
+
+  /* Header */
+  .app-header { text-align: center; padding: 10px 0 16px; }
+  .brand-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(139, 92, 246, 0.15); border: 1px solid var(--border-glow);
+    color: #c4b5fd; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.6px;
+    padding: 4px 12px; border-radius: 99px; margin-bottom: 8px; text-transform: uppercase;
+  }
+  .brand-dot { width: 7px; height: 7px; background: var(--accent-success); border-radius: 50%; box-shadow: 0 0 8px var(--accent-success); }
+  h1 {
+    font-size: 1.45rem; font-weight: 800; letter-spacing: -0.5px;
+    background: linear-gradient(90deg, #ffffff, #a5b4fc, #67e8f9);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 4px;
+  }
+  .sub { font-size: 0.76rem; color: var(--text-muted); }
+
+  /* Navigation Tabs (Separate Views!) */
+  .nav-tabs {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;
+    background: rgba(15, 23, 42, 0.9); padding: 6px; border-radius: 14px;
+    border: 1px solid var(--border-subtle); margin-bottom: 14px;
+    backdrop-filter: blur(12px); position: sticky; top: 8px; z-index: 50;
+  }
+  .tab-btn {
+    background: transparent; border: none; color: var(--text-muted);
+    padding: 10px 6px; border-radius: 10px; font-size: 0.78rem; font-weight: 700;
+    cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; justify-content: center; gap: 5px;
+  }
+  .tab-btn.active {
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.28), rgba(6, 182, 212, 0.22));
+    color: #fff; border: 1px solid var(--border-glow);
+    box-shadow: 0 4px 14px rgba(139, 92, 246, 0.2);
+  }
+  .tab-count {
+    background: rgba(255,255,255,0.12); color: #fff; padding: 1px 6px;
+    border-radius: 99px; font-size: 0.68rem; font-weight: 800;
+  }
+  .tab-count.pulse { background: var(--accent-secondary); color: #000; }
+  .tab-count.done-badge { background: var(--accent-success); color: #000; }
+
+  .tab-panel { display: none; animation: fadeIn 0.2s ease; }
+  .tab-panel.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* Cards */
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border-subtle);
+    border-radius: 16px; padding: 16px; margin-bottom: 14px;
+    backdrop-filter: blur(16px); box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  .section-title {
+    font-size: 0.82rem; font-weight: 700; color: #c4b5fd;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+
+  /* Upload Buttons */
+  .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  .file-drop-btn {
+    background: linear-gradient(180deg, rgba(30, 41, 59, 0.7), rgba(15, 23, 42, 0.9));
+    border: 1.5px dashed rgba(148, 163, 184, 0.35); border-radius: 14px;
+    padding: 16px 10px; text-align: center; cursor: pointer; transition: all 0.2s;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+  }
+  .file-drop-btn:hover, .file-drop-btn:active {
+    border-color: var(--accent-secondary); background: rgba(6, 182, 212, 0.08);
+    transform: translateY(-1px);
+  }
+  .file-drop-icon { font-size: 1.5rem; }
+  .file-drop-title { font-size: 0.84rem; font-weight: 700; color: #f1f5f9; }
+  .file-drop-sub { font-size: 0.68rem; color: var(--text-muted); }
   input[type="file"] { display: none; }
-  input[type="text"], select { width: 100%; padding: 9px; background: #0b0f19; border: 1px solid #334155; border-radius: 8px; color: #f8fafc; font-size: 0.85rem; margin-bottom: 8px; }
-  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .col { flex: 1; min-width: 130px; }
-  .btn-main { width: 100%; padding: 14px; background: linear-gradient(135deg, #f97316, #ea580c); color: #fff; border: none; border-radius: 10px; font-size: 0.95rem; font-weight: 700; cursor: pointer; }
-  .btn-main:disabled { background: #334155; color: #64748b; }
-  .file-summary { font-size: 0.8rem; color: #10b981; text-align: center; margin: 6px 0; font-weight: 600; }
-  .job-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
-  .job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-  .job-title { font-weight: 700; font-size: 0.9rem; color: #f8fafc; }
-  .job-badge { font-size: 0.72rem; padding: 2px 8px; border-radius: 99px; background: #1e293b; color: #fbbf24; }
-  .prog-bg { width: 100%; height: 8px; background: #1e293b; border-radius: 99px; overflow: hidden; margin: 6px 0; }
-  .prog-fill { height: 100%; background: #38bdf8; transition: width 0.3s; }
-  .log-line { font-family: monospace; font-size: 0.74rem; color: #94a3b8; background: #090d16; padding: 6px 8px; border-radius: 6px; margin-top: 6px; word-break: break-all; }
-  .btn-dl { display: block; width: 100%; padding: 11px; background: #10b981; color: #fff; text-align: center; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 0.85rem; margin-top: 8px; }
-  .btn-wipe { width: 100%; padding: 8px; background: #ef444422; color: #f87171; border: 1px solid #ef444455; border-radius: 8px; font-size: 0.75rem; font-weight: 600; margin-top: 6px; cursor: pointer; }
-  .gallery { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; max-height: 520px; overflow-y: auto; }
-  .gallery img { width: 100%; border-radius: 6px; border: 1px solid #334155; }
+
+  /* Dedicated Staged Uploaded Data Box */
+  .staged-box {
+    background: var(--bg-inner); border: 1px solid var(--border-subtle);
+    border-radius: 12px; padding: 10px; margin-bottom: 14px;
+  }
+  .staged-header {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.78rem; font-weight: 700; color: #e2e8f0; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-subtle); margin-bottom: 8px;
+  }
+  .staged-list {
+    max-height: 165px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px;
+    padding-right: 4px;
+  }
+  .staged-item {
+    display: flex; justify-content: space-between; align-items: center;
+    background: rgba(30, 41, 59, 0.55); padding: 6px 10px; border-radius: 8px;
+    font-size: 0.75rem; color: #cbd5e1;
+  }
+  .staged-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%; }
+  .staged-item-meta { font-size: 0.68rem; color: var(--accent-secondary); font-family: monospace; }
+  .clear-files-btn {
+    background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3);
+    padding: 3px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 600; cursor: pointer;
+  }
+
+  /* Inputs & Selects */
+  label.field-lbl { font-size: 0.76rem; font-weight: 600; color: #94a3b8; display: block; margin-bottom: 5px; }
+  input[type="text"], select {
+    width: 100%; padding: 11px 12px; background: var(--bg-inner);
+    border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 10px;
+    color: var(--text-main); font-size: 0.85rem; margin-bottom: 12px; outline: none;
+  }
+  input[type="text"]:focus, select:focus { border-color: var(--accent-primary); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* Primary Action Button & Upload Progress */
+  .btn-main {
+    width: 100%; padding: 14px;
+    background: linear-gradient(135deg, #8b5cf6 0%, #06b6d4 100%);
+    color: #fff; border: none; border-radius: 12px; font-size: 0.92rem; font-weight: 800;
+    cursor: pointer; box-shadow: 0 6px 20px rgba(139, 92, 246, 0.35); transition: opacity 0.2s;
+  }
+  .btn-main:disabled { background: #334155; color: #94a3b8; box-shadow: none; cursor: not-allowed; }
+  .upload-prog-wrap { display: none; margin-top: 10px; }
+
+  /* Job Cards */
+  .job-card {
+    background: var(--bg-inner); border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 14px; padding: 14px; margin-bottom: 12px; position: relative;
+  }
+  .job-card.done-card { border-color: rgba(16, 185, 129, 0.4); }
+  .job-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+  .job-title { font-weight: 800; font-size: 0.95rem; color: #fff; word-break: break-word; }
+  .job-meta-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .meta-pill {
+    font-size: 0.68rem; font-weight: 700; padding: 3px 8px; border-radius: 6px;
+    background: rgba(255,255,255,0.06); color: #cbd5e1;
+  }
+  .status-pill {
+    font-size: 0.7rem; font-weight: 800; padding: 3px 10px; border-radius: 99px; text-transform: uppercase;
+  }
+  .status-queued { background: rgba(245, 158, 11, 0.15); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.3); }
+  .status-processing { background: rgba(6, 182, 212, 0.15); color: #67e8f9; border: 1px solid rgba(6, 182, 212, 0.35); }
+  .status-done { background: rgba(16, 185, 129, 0.18); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
+  .status-error { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+
+  /* Progress Bar */
+  .prog-bg { width: 100%; height: 9px; background: #1e293b; border-radius: 99px; overflow: hidden; margin: 8px 0; }
+  .prog-fill {
+    height: 100%; background: linear-gradient(90deg, #8b5cf6, #06b6d4, #10b981);
+    transition: width 0.35s ease; border-radius: 99px;
+  }
+  .log-line {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: #94a3b8;
+    background: #05070b; border: 1px solid rgba(255,255,255,0.05);
+    padding: 7px 9px; border-radius: 8px; margin-top: 6px; word-break: break-all;
+  }
+
+  /* Download & Action Buttons */
+  .dl-grid { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .btn-dl-zip {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; padding: 13px; background: linear-gradient(135deg, #10b981, #059669);
+    color: #fff; text-align: center; text-decoration: none; border-radius: 10px;
+    font-weight: 800; font-size: 0.88rem; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+  }
+  .btn-dl-single {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; padding: 12px; background: linear-gradient(135deg, #06b6d4, #2563eb);
+    color: #fff; text-align: center; text-decoration: none; border-radius: 10px;
+    font-weight: 800; font-size: 0.86rem;
+  }
+  .btn-preview-toggle {
+    width: 100%; padding: 10px; background: rgba(139, 92, 246, 0.15);
+    color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.35); border-radius: 10px;
+    font-size: 0.8rem; font-weight: 700; cursor: pointer;
+  }
+  .btn-wipe {
+    width: 100%; padding: 9px; background: rgba(239, 68, 68, 0.1); color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 9px;
+    font-size: 0.75rem; font-weight: 700; margin-top: 6px; cursor: pointer;
+  }
+
+  /* Reader / Individual Page List inside Completed Tab */
+  .reader-box {
+    display: none; margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .reader-box.open { display: block; }
+  .page-card {
+    background: #070a12; border: 1px solid #1e293b; border-radius: 10px;
+    padding: 8px; margin-bottom: 10px;
+  }
+  .page-card-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 6px; font-size: 0.74rem; color: #93c5fd; font-weight: 600;
+  }
+  .page-dl-mini {
+    background: #1e293b; color: #38bdf8; text-decoration: none;
+    padding: 3px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700;
+  }
+  .page-card img { width: 100%; border-radius: 6px; display: block; }
+  .empty-state {
+    text-align: center; padding: 28px 12px; color: var(--text-muted); font-size: 0.84rem;
+  }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>Manga & Manhwa Translator <span class="badge">100% Pure RAM</span></h1>
-  <div class="sub">YOLOv8 • Qwen3.5-9B Vision OCR • Qwen3.8-27B + MTP Translator</div>
-
-  <div class="card">
-    <label>1. Select Manga/Manhwa Images or Whole Folder (Sent Straight to Kaggle RAM)</label>
-    <div class="upload-grid">
-      <label class="file-btn">
-        🖼️ Select Images
-        <input type="file" id="filesInput" accept="image/*"multiple>
-      </label>
-      <label class="file-btn">
-        📁 Select Folder
-        <input type="file" id="folderInput" webkitdirectory directory multiple>
-      </label>
-    </div>
-    <div id="fileSummary" class="file-summary">No files selected yet</div>
-
-    <label>2. Chapter / Batch Name (Used for Output ZIP & Queue)</label>
-    <input type="text" id="chapterName" placeholder="Auto-filled from folder name or e.g. Chapter_01">
-
-    <div class="row">
-      <div class="col">
-        <label>Reading Order</label>
-        <select id="readingOrder">
-          <option value="rtl" selected>🇯🇵 Manga (Right-to-Left)</option>
-          <option value="ltr">🇰🇷🇨🇳 Manhwa/Manhua (Left-to-Right)</option>
-        </select>
-      </div>
-      <div class="col">
-        <label>27B Translation Mode</label>
-        <select id="thinkingMode">
-          <option value="false" selected>⚡ Direct JSON (Fastest, No Think)</option>
-          <option value="true">🧠 Deep Thinking (Strip &lt;think&gt;)</option>
-        </select>
-      </div>
-    </div>
-
-    <button id="submitBtn" class="btn-main" onclick="uploadBatch()">🚀 Upload to RAM & Join Translation Queue</button>
+  <!-- Header -->
+  <div class="app-header">
+    <div class="brand-pill"><span class="brand-dot"></span> Dual T4 • 100% Pure RAM Engine</div>
+    <h1>Manga & Manhwa AI Studio</h1>
+    <div class="sub">YOLOv8 • Qwen3.5-9B Vision OCR • Qwen3.8-27B + MTP Translator</div>
   </div>
 
-  <div class="card">
-    <label>📋 Active & Completed Jobs in RAM (Queue)</label>
-    <div id="jobsContainer" style="font-size:0.8rem; color:#64748b; text-align:center;">No active jobs in RAM.</div>
+  <!-- 3 Separate View Tabs -->
+  <div class="nav-tabs">
+    <button class="tab-btn active" id="tabBtn-upload" onclick="switchTab('upload')">
+      📤 Upload <span class="tab-count" id="stagedBadge">0</span>
+    </button>
+    <button class="tab-btn" id="tabBtn-queue" onclick="switchTab('queue')">
+      ⚡ Queue <span class="tab-count" id="activeBadge">0</span>
+    </button>
+    <button class="tab-btn" id="tabBtn-done" onclick="switchTab('done')">
+      📦 Ready <span class="tab-count done-badge" id="doneBadge">0</span>
+    </button>
+  </div>
+
+  <!-- ================= TAB 1: UPLOAD & STAGED FILES VIEW ================= -->
+  <div class="tab-panel active" id="panel-upload">
+    <div class="card">
+      <div class="section-title">
+        <span>1. Select Raw Pages or Folder</span>
+      </div>
+      <div class="upload-grid">
+        <label class="file-drop-btn">
+          <span class="file-drop-icon">🖼️</span>
+          <span class="file-drop-title">Select Images</span>
+          <span class="file-drop-sub">1 or multiple pages</span>
+          <input type="file" id="filesInput" accept="image/*" multiple>
+        </label>
+        <label class="file-drop-btn">
+          <span class="file-drop-icon">📁</span>
+          <span class="file-drop-title">Select Folder</span>
+          <span class="file-drop-sub">Full 60+ page chapter</span>
+          <input type="file" id="folderInput" webkitdirectory directory multiple>
+        </label>
+      </div>
+
+      <!-- Dedicated Staged Data Inspector -->
+      <div class="staged-box">
+        <div class="staged-header">
+          <span id="fileSummaryText">📂 No files staged yet</span>
+          <button class="clear-files-btn" id="clearStagedBtn" style="display:none;" onclick="clearStagedFiles()">✖ Clear</button>
+        </div>
+        <div class="staged-list" id="stagedFilesList">
+          <div style="text-align:center;color:#64748b;font-size:0.75rem;padding:10px;">
+            Selected images or folder contents will appear here in reading order before sending to RAM.
+          </div>
+        </div>
+      </div>
+
+      <div class="section-title"><span>2. Translation Settings</span></div>
+      <label class="field-lbl">Chapter / Batch Name (Used for Output ZIP & Queue)</label>
+      <input type="text" id="chapterName" placeholder="Auto-filled from folder name or e.g. Chapter_01">
+
+      <div class="row">
+        <div>
+          <label class="field-lbl">Reading Order</label>
+          <select id="readingOrder">
+            <option value="rtl" selected>🇯🇵 Manga (Right-to-Left)</option>
+            <option value="ltr">🇰🇷🇨🇳 Manhwa (Left-to-Right)</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-lbl">27B Translation Mode</label>
+          <select id="thinkingMode">
+            <option value="false" selected>⚡ Direct JSON (Fastest)</option>
+            <option value="true">🧠 Deep Thinking</option>
+          </select>
+        </div>
+      </div>
+
+      <button id="submitBtn" class="btn-main" onclick="uploadBatch()">🚀 Send to Kaggle RAM & Start Translation</button>
+
+      <!-- Live Upload Progress Bar -->
+      <div class="upload-prog-wrap" id="uploadProgWrap">
+        <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#67e8f9;margin-bottom:4px;">
+          <span id="uploadProgLabel">Uploading to RAM...</span>
+          <span id="uploadProgPct">0%</span>
+        </div>
+        <div class="prog-bg"><div class="prog-fill" id="uploadProgBar" style="width:0%;"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= TAB 2: ACTIVE QUEUE VIEW ================= -->
+  <div class="tab-panel" id="panel-queue">
+    <div class="card">
+      <div class="section-title">
+        <span>⚡ Active GPU Processing & Queue</span>
+        <span style="font-size:0.7rem;color:#94a3b8;text-transform:none;">Auto-refreshes every 2s</span>
+      </div>
+      <div id="activeJobsContainer" class="empty-state">No jobs currently processing in GPU/RAM.</div>
+    </div>
+  </div>
+
+  <!-- ================= TAB 3: COMPLETED & DOWNLOADS VIEW ================= -->
+  <div class="tab-panel" id="panel-done">
+    <div class="card">
+      <div class="section-title">
+        <span>📦 Completed Chapters & Single Images</span>
+        <span style="font-size:0.7rem;color:#10b981;text-transform:none;">Pure RAM Stream</span>
+      </div>
+      <div id="doneJobsContainer" class="empty-state">No completed translations yet. Finished jobs will appear here automatically!</div>
+    </div>
   </div>
 </div>
 
 <script>
 let selectedFiles = [];
+let openPreviews = {}; // Remembers which job galleries the user opened so polling never closes them!
+let lastDoneCount = 0;
+
+function switchTab(tabName) {
+  ['upload', 'queue', 'done'].forEach(t => {
+    document.getElementById('tabBtn-' + t).classList.toggle('active', t === tabName);
+    document.getElementById('panel-' + t).classList.toggle('active', t === tabName);
+  });
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+function clearStagedFiles() {
+  selectedFiles = [];
+  document.getElementById('filesInput').value = '';
+  document.getElementById('folderInput').value = '';
+  renderStagedFiles();
+}
 
 function handleSelectedFiles(fileList, isFolder) {
   const validExts = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -503,33 +781,66 @@ function handleSelectedFiles(fileList, isFolder) {
   });
   selectedFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'}));
 
-  const sumEl = document.getElementById('fileSummary');
   const chapInput = document.getElementById('chapterName');
-
   if (selectedFiles.length > 0) {
-    sumEl.innerText = `✅ Selected ${selectedFiles.length} image(s) ready for RAM upload`;
     if (isFolder && selectedFiles[0].webkitRelativePath) {
       const folderName = selectedFiles[0].webkitRelativePath.split('/')[0];
-      if (folderName && !chapInput.value) chapInput.value = folderName;
+      if (folderName) chapInput.value = folderName;
     } else if (!chapInput.value) {
-      chapInput.value = "Manga_Batch_" + new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}).replace(':','-');
+      chapInput.value = selectedFiles.length === 1
+        ? selectedFiles[0].name.replace(/\\.[^/.]+$/, "")
+        : "Chapter_" + new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}).replace(':','-');
     }
-  } else {
-    sumEl.innerText = "No valid image files found";
   }
+  renderStagedFiles();
+}
+
+function renderStagedFiles() {
+  const sumEl = document.getElementById('fileSummaryText');
+  const listEl = document.getElementById('stagedFilesList');
+  const clearBtn = document.getElementById('clearStagedBtn');
+  const badge = document.getElementById('stagedBadge');
+
+  badge.innerText = selectedFiles.length;
+
+  if (selectedFiles.length === 0) {
+    sumEl.innerText = "📂 No files staged yet";
+    clearBtn.style.display = "none";
+    listEl.innerHTML = `<div style="text-align:center;color:#64748b;font-size:0.75rem;padding:10px;">Selected images or folder contents will appear here in reading order before sending to RAM.</div>`;
+    return;
+  }
+
+  const totalBytes = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+  sumEl.innerText = `✅ ${selectedFiles.length} Page(s) Staged (${formatBytes(totalBytes)})`;
+  clearBtn.style.display = "inline-block";
+
+  listEl.innerHTML = selectedFiles.map((f, idx) => `
+    <div class="staged-item">
+      <span class="staged-item-name">#${idx + 1} • ${f.name}</span>
+      <span class="staged-item-meta">${formatBytes(f.size)}</span>
+    </div>
+  `).join('');
 }
 
 document.getElementById('filesInput').addEventListener('change', e => handleSelectedFiles(e.target.files, false));
 document.getElementById('folderInput').addEventListener('change', e => handleSelectedFiles(e.target.files, true));
 
-async function uploadBatch() {
+function uploadBatch() {
   if (selectedFiles.length === 0) {
     alert("Please select images or a folder first!");
     return;
   }
   const btn = document.getElementById('submitBtn');
+  const progWrap = document.getElementById('uploadProgWrap');
+  const progBar = document.getElementById('uploadProgBar');
+  const progPct = document.getElementById('uploadProgPct');
+  const progLbl = document.getElementById('uploadProgLabel');
+
   btn.disabled = true;
-  btn.innerText = `⏳ Uploading ${selectedFiles.length} images into Kaggle RAM...`;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  progPct.innerText = '0%';
+  progLbl.innerText = `Uploading ${selectedFiles.length} file(s) to Kaggle RAM...`;
 
   const formData = new FormData();
   formData.append('chapter_name', document.getElementById('chapterName').value || 'Manga_Chapter');
@@ -540,28 +851,55 @@ async function uploadBatch() {
     formData.append('images', file, file.name);
   }
 
-  try {
-    const res = await fetch('/api/upload_job', { method: 'POST', body: formData });
-    const data = await res.json();
-    if (data.error) {
-      alert("Error: " + data.error);
-    } else {
-      selectedFiles = [];
-      document.getElementById('filesInput').value = '';
-      document.getElementById('folderInput').value = '';
-      document.getElementById('chapterName').value = '';
-      document.getElementById('fileSummary').innerText = "✅ Uploaded! You can immediately select & queue another folder.";
-      refreshJobs();
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload_job', true);
+
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      progBar.style.width = pct + '%';
+      progPct.innerText = pct + '%';
+      if (pct === 100) {
+        progLbl.innerText = 'Decoding images into Kaggle RAM...';
+      }
     }
-  } catch (e) {
-    alert("Upload failed: " + e);
-  } finally {
+  };
+
+  xhr.onload = function() {
     btn.disabled = false;
-    btn.innerText = "🚀 Upload to RAM & Join Translation Queue";
-  }
+    progWrap.style.display = 'none';
+    if (xhr.status >= 200 && xhr.status < 300) {
+      const data = JSON.parse(xhr.responseText);
+      if (data.error) {
+        alert("Error: " + data.error);
+      } else {
+        clearStagedFiles();
+        document.getElementById('chapterName').value = '';
+        refreshJobs();
+        switchTab('queue'); // Automatically take user to Active Queue view!
+      }
+    } else {
+      alert("Upload failed with status " + xhr.status);
+    }
+  };
+
+  xhr.onerror = function() {
+    btn.disabled = false;
+    progWrap.style.display = 'none';
+    alert("Network error while uploading batch.");
+  };
+
+  xhr.send(formData);
+}
+
+function togglePreview(jobId) {
+  openPreviews[jobId] = !openPreviews[jobId];
+  const el = document.getElementById('reader-' + jobId);
+  if (el) el.classList.toggle('open', !!openPreviews[jobId]);
 }
 
 async function wipeJob(jobId) {
+  delete openPreviews[jobId];
   await fetch('/api/wipe_job/' + jobId, { method: 'POST' });
   refreshJobs();
 }
@@ -570,49 +908,115 @@ async function refreshJobs() {
   try {
     const res = await fetch('/api/jobs');
     const data = await res.json();
-    const container = document.getElementById('jobsContainer');
-    if (!data.jobs || data.jobs.length === 0) {
-      container.innerHTML = "No active jobs in RAM.";
-      return;
+    const allJobs = data.jobs || [];
+
+    const activeJobs = allJobs.filter(j => j.status === 'queued' || j.status === 'processing');
+    const doneJobs = allJobs.filter(j => j.status === 'done' || j.status === 'error');
+
+    const activeBadge = document.getElementById('activeBadge');
+    const doneBadge = document.getElementById('doneBadge');
+    activeBadge.innerText = activeJobs.length;
+    activeBadge.classList.toggle('pulse', activeJobs.length > 0);
+    doneBadge.innerText = doneJobs.length;
+
+    // Auto-switch to Ready tab when a new job finishes while user is watching Queue!
+    const strictlyDoneCount = doneJobs.filter(j => j.status === 'done').length;
+    if (strictlyDoneCount > lastDoneCount && activeJobs.length === 0 && document.getElementById('panel-queue').classList.contains('active')) {
+      switchTab('done');
     }
+    lastDoneCount = strictlyDoneCount;
 
-    container.innerHTML = data.jobs.map(j => {
-      let actionsHtml = '';
-      if (j.status === 'done') {
-        const galleryImgs = (j.out_pages || []).map(p =>
-          `<div><div style="font-size:0.72rem;color:#93c5fd;margin-bottom:2px;">${p.filename}</div><img src="data:image/png;base64,${p.b64}" loading="lazy"></div>`
-        ).join('');
-        actionsHtml = `
-          <a class="btn-dl" href="/api/download_zip/${j.job_id}" download="${j.chapter_name}_Translated.zip">
-            📦 Download Full Translated Chapter (.ZIP) (${j.page_count} Pages)
-          </a>
-          <details style="margin-top:8px;">
-            <summary style="cursor:pointer;color:#38bdf8;font-size:0.8rem;font-weight:600;">👁️ Tap to View Translated Pages (${j.page_count})</summary>
-            <div class="gallery">${galleryImgs}</div>
-          </details>
-          <button class="btn-wipe" onclick="wipeJob('${j.job_id}')">🧹 Clear Job from Kaggle RAM</button>
-        `;
-      } else if (j.status === 'error') {
-        actionsHtml = `<button class="btn-wipe" onclick="wipeJob('${j.job_id}')">✖ Remove Failed Job from RAM</button>`;
-      }
-
-      return `
+    // Render Active Queue Tab
+    const activeContainer = document.getElementById('activeJobsContainer');
+    if (activeJobs.length === 0) {
+      activeContainer.innerHTML = `<div class="empty-state">No jobs currently processing. Upload a folder or image in the Upload tab!</div>`;
+    } else {
+      activeContainer.innerHTML = activeJobs.map(j => `
         <div class="job-card" style="text-align:left;">
           <div class="job-header">
-            <span class="job-title">📁 ${j.chapter_name} (${j.page_count} pages)</span>
-            <span class="job-badge">${j.status.toUpperCase()}</span>
+            <span class="job-title">📁 ${j.chapter_name}</span>
+            <span class="status-pill status-${j.status}">${j.status}</span>
           </div>
-          <div style="font-size:0.78rem;color:#cbd5e1;">${j.phase}</div>
+          <div class="job-meta-pills">
+            <span class="meta-pill">📄 ${j.page_count} Page(s)</span>
+            <span class="meta-pill">${j.rtl ? '🇯🇵 RTL Manga' : '🇰🇷 LTR Manhwa'}</span>
+          </div>
+          <div style="font-size:0.8rem;color:#e2e8f0;font-weight:600;">${j.phase}</div>
           <div class="prog-bg"><div class="prog-fill" style="width:${j.progress}%;"></div></div>
           <div class="log-line">${j.last_log || 'Waiting in queue...'}</div>
-          ${actionsHtml}
         </div>
-      `;
-    }).join('');
+      `).join('');
+    }
+
+    // Render Completed / Downloads Tab
+    const doneContainer = document.getElementById('doneJobsContainer');
+    if (doneJobs.length === 0) {
+      doneContainer.innerHTML = `<div class="empty-state">No completed translations in RAM yet.</div>`;
+    } else {
+      doneContainer.innerHTML = doneJobs.map(j => {
+        if (j.status === 'error') {
+          return `
+            <div class="job-card" style="text-align:left;">
+              <div class="job-header">
+                <span class="job-title">📁 ${j.chapter_name}</span>
+                <span class="status-pill status-error">FAILED</span>
+              </div>
+              <div class="log-line">${j.phase}</div>
+              <button class="btn-wipe" onclick="wipeJob('${j.job_id}')">✖ Remove Failed Job from RAM</button>
+            </div>
+          `;
+        }
+
+        const isOpen = !!openPreviews[j.job_id];
+        const singleDownloadBtn = j.page_count === 1 ? `
+          <a class="btn-dl-single" href="/api/page/${j.job_id}/0?dl=1" download="${j.filenames[0] || 'translated.png'}">
+            🖼️ Download Translated Image Directly (PNG)
+          </a>
+        ` : '';
+
+        // Only load <img> elements when the user opens the preview reader!
+        const pagesHtml = isOpen ? (j.filenames || []).map((fname, idx) => `
+          <div class="page-card">
+            <div class="page-card-head">
+              <span>#${idx + 1} • ${fname}</span>
+              <a class="page-dl-mini" href="/api/page/${j.job_id}/${idx}?dl=1" download="${fname}">⬇ Save PNG</a>
+            </div>
+            <img src="/api/page/${j.job_id}/${idx}" loading="lazy">
+          </div>
+        `).join('') : '';
+
+        return `
+          <div class="job-card done-card" style="text-align:left;">
+            <div class="job-header">
+              <span class="job-title">✅ ${j.chapter_name}</span>
+              <span class="status-pill status-done">READY</span>
+            </div>
+            <div class="job-meta-pills">
+              <span class="meta-pill">📄 ${j.page_count} Page(s)</span>
+              <span class="meta-pill">💬 ${j.total_bubbles || 0} Bubbles</span>
+              <span class="meta-pill">⏱️ ${j.elapsed || 0}s</span>
+            </div>
+            <div class="dl-grid">
+              ${singleDownloadBtn}
+              <a class="btn-dl-zip" href="/api/download_zip/${j.job_id}" download="${j.chapter_name}_Translated.zip">
+                📦 Download All ${j.page_count} Page(s) as .ZIP (Fast Binary Stream)
+              </a>
+              <button class="btn-preview-toggle" onclick="togglePreview('${j.job_id}')">
+                ${isOpen ? '🔼 Hide Translated Pages' : `👁️ Preview / Download Individual Pages (${j.page_count})`}
+              </button>
+            </div>
+            <div class="reader-box ${isOpen ? 'open' : ''}" id="reader-${j.job_id}">
+              ${pagesHtml}
+            </div>
+            <button class="btn-wipe" onclick="wipeJob('${j.job_id}')">🧹 Purge Job from Kaggle RAM</button>
+          </div>
+        `;
+      }).join('');
+    }
   } catch (e) {}
 }
 
-setInterval(refreshJobs, 2500);
+setInterval(refreshJobs, 2000);
 refreshJobs();
 </script>
 </body>
@@ -620,7 +1024,7 @@ refreshJobs();
 """
 
 # ─────────────────────────────────────────────────────────────
-# FLASK API ROUTES (PURE RAM)
+# FLASK API ROUTES (ULTRA-FAST BINARY STREAMING FROM RAM)
 # ─────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # Allow up to 1 GB batch upload in RAM
@@ -676,6 +1080,8 @@ def api_upload_job():
             "pages_in_ram": ram_pages,
             "out_pages": [],
             "zip_bytes": None,
+            "elapsed": 0,
+            "total_bubbles": 0,
             "created_at": time.time()
         }
 
@@ -686,24 +1092,56 @@ def api_upload_job():
 
 @app.route("/api/jobs", methods=["GET"])
 def api_list_jobs():
+    """
+    LIGHTWEIGHT METADATA ONLY (~2 KB):
+    Never sends 200 MB of Base64 images inside the status poll!
+    """
     with JOBS_LOCK:
         jobs_list = []
         for jid, j in sorted(JOBS_RAM.items(), key=lambda item: item[1]["created_at"], reverse=True):
+            filenames = [p["filename"] for p in j.get("out_pages", [])] if j["status"] == "done" else []
             jobs_list.append({
                 "job_id": jid,
                 "chapter_name": j["chapter_name"],
                 "page_count": j["page_count"],
+                "rtl": j.get("rtl", True),
                 "status": j["status"],
                 "phase": j["phase"],
                 "progress": j["progress"],
                 "last_log": j["last_log"],
-                "out_pages": j["out_pages"] if j["status"] == "done" else []
+                "elapsed": j.get("elapsed", 0),
+                "total_bubbles": j.get("total_bubbles", 0),
+                "filenames": filenames
             })
     return jsonify({"jobs": jobs_list})
 
 
+@app.route("/api/page/<job_id>/<int:page_idx>", methods=["GET"])
+def api_get_single_page(job_id, page_idx):
+    """Streams a single translated PNG directly from RAM (for fast preview or 1-image download)."""
+    with JOBS_LOCK:
+        job = JOBS_RAM.get(job_id)
+        if not job or job.get("status") != "done":
+            return "Page not found", 404
+        out_pages = job.get("out_pages", [])
+        if page_idx < 0 or page_idx >= len(out_pages):
+            return "Invalid page index", 404
+        page_info = out_pages[page_idx]
+        png_bytes = page_info["bytes"]
+        fname = page_info["filename"]
+
+    as_dl = request.args.get("dl", "0") == "1"
+    return send_file(
+        io.BytesIO(png_bytes),
+        mimetype="image/png",
+        as_attachment=as_dl,
+        download_name=fname
+    )
+
+
 @app.route("/api/download_zip/<job_id>", methods=["GET"])
 def api_download_zip(job_id):
+    """Streams the entire translated chapter ZIP directly from RAM in binary mode."""
     with JOBS_LOCK:
         job = JOBS_RAM.get(job_id)
         if not job or not job.get("zip_bytes"):
@@ -711,7 +1149,6 @@ def api_download_zip(job_id):
         zip_bytes = job["zip_bytes"]
         dl_name = f"{job['chapter_name']}_Translated.zip"
 
-    # Stream directly from RAM to Mobile
     return send_file(
         io.BytesIO(zip_bytes),
         mimetype="application/zip",
