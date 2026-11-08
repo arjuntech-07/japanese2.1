@@ -63,7 +63,8 @@ def ensure_llama_server_binary():
 def ensure_translation_models_downloaded():
     """Downloads Qwen3.8-27B Q6_K (~22.4 GB) and MTP Draft Q8_0 (~3.16 GB) into /tmp/models."""
     os.makedirs(MODEL_DIR, exist_ok=True)
-    hf_token = os.environ.get("HF_TOKEN", "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")
+    hf_token = os.environ.get("HF_TOKEN", None)
+  
 
     # 1. Main 27B Model (~22.4 GB)
     if os.path.exists(TRANS_MODEL_PATH) and os.path.getsize(TRANS_MODEL_PATH) > 20 * 1e9:
