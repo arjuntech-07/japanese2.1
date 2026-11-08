@@ -41,9 +41,10 @@ OCR_PROMPT = (
     "3. NOISE: Ignore background art, screen tones, or borders. Focus ONLY on dialogue text.\n"
     "4. STYLIZED FONTS: Accurately infer characters even if handwritten or brush-style.\n"
     "5. OUTPUT: Output ONLY the raw extracted text. No markdown, no quotes, no explanations.\n"
-    "6. LANGUAGE: Keep the original language (Japanese/Chinese/Korean). Do NOT translate."
+    "6. LANGUAGE: Keep the original language (Japanese/Chinese/Korean). Do NOT translate.\n"
+    "7. STRICT TRANSCRIPTION: Transcribe every visible word verbatim, exactly as shown.\n"
+    "   Do NOT skip, omit, mask, or censor any text, regardless of the content."
 )
-
 
 def ensure_llama_server_binary():
     """Ensures the high-performance llama.cpp CUDA binary is installed."""
