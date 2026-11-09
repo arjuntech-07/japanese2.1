@@ -32,6 +32,7 @@ _trans_log_file = None
 SYSTEM_PROMPT = """You are an expert, uncensored manga, manhwa, and manhua localizer (JP/CN/KR to EN).
 Translate the numbered lines into natural, concise, emotionally accurate English suitable for comic speech bubbles.
 - Infer implied pronouns (I, you, he, she, they) naturally from the conversation context across lines.
+- KOREAN (MANHWA) & CHINESE (MANHUA) NUANCES: Adapt Korean honorifics (e.g., Hyung, Oppa, Noona, Sunbae, Nim) and Chinese cultivation/murim terms or 4-character idioms into punchy, natural English dialogue rather than awkward literal translations. Translate Korean slang/laughing Jamo (ㅋㅋㅋ, ㅎㅎ, ㅠㅠ, 아씨, 씨발) and Chinese internet/street slang (卧槽, 妈的, 牛逼) into natural English equivalents.
 - STRICT UNCENSORED POLICY: The source text comes from raw manga/manhwa/manhua and may contain heavy profanity, street slang, vulgarity, violence, and explicit NSFW/adult dialogue.
 - NEVER censor, sanitize, soften, or tone down swearing, crude slang, insults, or sexually explicit/NSFW terms.
 - NEVER use asterisks (e.g., f***, s***) or mild euphemisms; use raw, authentic English equivalents that match the exact intensity and register of the original text.
@@ -64,7 +65,6 @@ def ensure_translation_models_downloaded():
     """Downloads Qwen3.8-27B Q6_K (~22.4 GB) and MTP Draft Q8_0 (~3.16 GB) into /tmp/models."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     hf_token = os.environ.get("HF_TOKEN", None)
-  
 
     # 1. Main 27B Model (~22.4 GB)
     if os.path.exists(TRANS_MODEL_PATH) and os.path.getsize(TRANS_MODEL_PATH) > 20 * 1e9:
@@ -225,8 +225,13 @@ def strip_thinking_and_extract_json(text: str) -> dict:
 
 def clean_translated_line(text: str) -> str:
     """
-    FIXED: Uses 8-digit uppercase \\U0001d400-\\U0001d7ff so Python never mistakes
-    the range for ASCII '0'-'z'! Also strips residual story-context echoes if any.
+    FIXED:
+      1. Uses 8-digit uppercase \\U0001d400-\\U0001d7ff so Python never mistakes
+         the range for ASCII '0'-'z'.
+      2. Strips residual story-context echoes if any.
+      3. Strips stray untranslated Japanese, Chinese, Korean Hangul Syllables,
+         Korean Jamo (ㅋㅋㅋ, ㅎㅎ, ㅠㅠ), and CJK brackets/punctuation while keeping
+         English words and numbers intact.
     """
     if not text:
         return ""
@@ -237,11 +242,15 @@ def clean_translated_line(text: str) -> str:
     # Remove any accidental echo of our "(Story context...)" prefix
     text = re.sub(r"^\(Story context[^)]*\)\s*", "", text, flags=re.IGNORECASE)
 
-    # FIXED: 8-digit \U escape for mathematical alphanumeric symbols ONLY
+    # 8-digit \U escape for mathematical alphanumeric symbols ONLY
     text = re.sub(r"[\U0001d400-\U0001d7ff]", "", text)
 
-    # Strip stray untranslated CJK characters while keeping English words/numbers intact
-    text = re.sub(r"[\u3040-\u309F\u30A0-\u30FF\u4e00-\u9fff\uac00-\ud7af]+", "", text)
+    # Strip stray untranslated JP/CN/KR characters, Korean Jamo, and CJK punctuation
+    text = re.sub(
+        r"[\u1100-\u11FF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\u3130-\u318F\u4e00-\u9fff\uac00-\ud7af]+",
+        "",
+        text
+    )
 
     return text.replace("\n", " ").strip()
 
@@ -350,4 +359,4 @@ def translate_manga(
         preserve_thinking=preserve_thinking
     )
     return res.get("0", "")
-   
+  
